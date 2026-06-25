@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-
+from app.services.llm_service import generate_answer
 from app.services.embedding_service import model
 from app.services.chroma_service import search_chunks
 from app.services.chroma_service import collection
@@ -47,8 +47,21 @@ async def query_notes(request: QueryRequest):
                 "content": doc
             }
         )
+    retrieved_chunks = documents
 
+    answer = generate_answer(
+        request.question,
+        retrieved_chunks
+    )
+    
+    
     return {
         "question": request.question,
-        "results": formatted_results
+        "answer": answer,
+        "sources": list(
+            set(
+                meta["source"]
+                for meta in metadatas
+            )
+        )
     }
