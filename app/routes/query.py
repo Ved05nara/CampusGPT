@@ -1,145 +1,119 @@
+import logging
+import time
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from app.services.llm_service import generate_answer
+
+from app.services.chroma_service import collection, search_chunks
 from app.services.embedding_service import model
-from app.services.chroma_service import search_chunks
-from app.services.chroma_service import collection
-from app.services.memory_service import (
-    add_message,
-    get_history,
-    clear_history
-)
+from app.services.llm_service import generate_answer
+from app.services.memory_service import add_message, clear_history, get_history
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+NO_ANSWER_MSG = "I could not find that information in the uploaded notes."
+HISTORY_CONTEXT_TURNS = 3  # How many recent user turns to include in search query
+
+
+# ---------------------------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------------------------
 
 
 @router.get("/stats")
 def stats():
+    """Return the total number of stored chunks."""
+    return {"total_chunks": collection.count()}
 
-    return {
-        "total_chunks": collection.count()
-    }
 
 @router.get("/health")
 def health():
-    return {
-        "status": "running",
-        "chunks": collection.count()
-    }
+    """Health check endpoint."""
+    return {"status": "running", "chunks": collection.count()}
+
 
 @router.post("/reset-chat")
 def reset_chat():
-
+    """Clear the conversation history."""
     clear_history()
+    return {"message": "Chat history cleared"}
 
-    return {
-        "message": "Chat history cleared"
-    }
+
+# ---------------------------------------------------------------------------
+# Query endpoint
+# ---------------------------------------------------------------------------
+
+
 class QueryRequest(BaseModel):
     question: str
 
 
 @router.post("/query")
 async def query_notes(request: QueryRequest):
+    """
+    Accept a question, retrieve relevant chunks from ChromaDB,
+    and return an LLM-generated answer grounded in those chunks.
+    """
     try:
         history = get_history()
-        search_query = request.question
 
-        if len(history) > 0:
+        # Build a richer search query by appending recent context
+        recent_user_questions = [
+            msg["content"]
+            for msg in history
+            if msg["role"] == "user"
+        ][-HISTORY_CONTEXT_TURNS:]
 
-            last_user_questions = [
-                msg["content"]
-                for msg in history
-                if msg["role"] == "user"
-            ]
+        search_query = " ".join(recent_user_questions + [request.question])
 
-            if last_user_questions:
-                search_query = (
-                    last_user_questions[-1]
-                    + " "
-                    + request.question
-                )
-
-        question_embedding = model.encode(
-            search_query
-        ).tolist()
-
+        question_embedding = model.encode(search_query).tolist()
         results = search_chunks(question_embedding)
 
         documents = results.get("documents", [[]])[0] if results else []
         metadatas = results.get("metadatas", [[]])[0] if results else []
         distances = results.get("distances", [[]])[0] if results else []
 
+        # No chunks found — return early without calling the LLM
         if not documents:
-            answer = "I could not find that information in the uploaded notes."
+            answer = NO_ANSWER_MSG
             add_message("user", request.question)
             add_message("assistant", answer)
-
             return {
                 "question": request.question,
                 "answer": answer,
-                "sources": ["N/A"]
+                "sources": [],
             }
 
-        formatted_results = []
+        logger.debug("Question: %s", request.question)
+        logger.debug(
+            "Retrieved %d chunks (top distance: %.4f)",
+            len(documents),
+            distances[0] if distances else -1,
+        )
 
-        for doc, meta, distance in zip(
-            documents,
-            metadatas,
-            distances
-        ):
-            formatted_results.append(
-                {
-                    "source": meta.get("source", "N/A"),
-                    "distance": distance,
-                    "content": doc
-                }
-            )
-        retrieved_chunks = documents
-
-        history = get_history()
-
-        print("\nQUESTION:")
-        print(request.question)
-
-        print("\nRETRIEVED CHUNKS:")
-        for chunk in retrieved_chunks:
-            print(chunk[:300])
-            print("-" * 50)
-        
+        start = time.time()
         answer = generate_answer(
-            request.question,
-            retrieved_chunks,
-            history
+            question=request.question,
+            retrieved_chunks=documents,
+            chat_history=history,
         )
-        
-        add_message(
-            "user",
-            request.question
-        )
+        logger.info("LLM response time: %.2f sec", time.time() - start)
 
-        add_message(
-            "assistant",
-            answer
-        )
+        add_message("user", request.question)
+        add_message("assistant", answer)
 
-        sources = list(
-            set(
-                meta.get("source", "N/A")
-                for meta in metadatas
-            )
-        )
-
-        if answer.strip() == "I could not find that information in the uploaded notes.":
-            sources = ["N/A"]
+        sources = list({meta.get("source", "N/A") for meta in metadatas})
+        if answer.strip() == NO_ANSWER_MSG:
+            sources = []
 
         return {
             "question": request.question,
             "answer": answer,
-            "sources": sources
+            "sources": sources,
         }
+
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Query failed: {exc}"
-        )
+        logger.exception("Query failed")
+        raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc
