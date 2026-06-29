@@ -9,8 +9,10 @@ from pydantic import BaseModel, Field
 from app.services.chroma_service import collection, search_chunks
 from app.services.embedding_service import model as embed_model
 from app.services.llm_service import (
-    generate_answer, generate_general_overview,
-    stream_answer, stream_general_overview,
+    generate_answer,
+    generate_general_overview,
+    stream_answer,
+    stream_general_overview,
     compute_confidence,
 )
 from app.services.memory_service import add_message, clear_history, get_history
@@ -19,19 +21,57 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 NO_ANSWER_MSG = "I could not find that information in the uploaded notes."
-RELEVANCE_DISTANCE_THRESHOLD = 1.2
+
+# ── Tuned thresholds ───────────────────────────────────────────────────────────
+# all-MiniLM-L6-v2 L2 distances: <0.5 = very relevant, 0.5–0.8 = relevant,
+# >0.8 = loosely related, >1.0 = likely off-topic.
+# Keep only chunks below this distance; if none survive → fall back to general.
+RELEVANCE_DISTANCE_THRESHOLD = 0.8
+
+# How many recent user turns to blend into the search query for follow-ups
+SEARCH_HISTORY_TURNS = 2
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _retrieve(question: str) -> tuple[list, list, list]:
-    """Embed question and fetch top-k chunks from ChromaDB."""
-    embedding = embed_model.encode(question).tolist()
+def _build_search_query(question: str, history: list[dict]) -> str:
+    """
+    Blend the last N user messages into the search query so that
+    follow-up questions like "explain it further" retrieve the right chunks.
+    """
+    recent = [
+        m["content"] for m in history if m["role"] == "user"
+    ][-SEARCH_HISTORY_TURNS:]
+    return " ".join(recent + [question])
+
+
+def _retrieve(question: str, history: list[dict]) -> tuple[list, list, list]:
+    """Embed question (with history context) and fetch top-k chunks from ChromaDB."""
+    search_query = _build_search_query(question, history)
+    embedding = embed_model.encode(search_query).tolist()
     results = search_chunks(embedding)
     docs  = results.get("documents", [[]])[0] if results else []
     metas = results.get("metadatas", [[]])[0] if results else []
     dists = results.get("distances", [[]])[0] if results else []
     return docs, metas, dists
+
+
+def _filter_by_relevance(
+    docs: list, metas: list, dists: list
+) -> tuple[list, list, list]:
+    """
+    Drop any chunk whose L2 distance exceeds the threshold.
+    This prevents off-topic chunks from polluting the LLM prompt.
+    """
+    filtered = [
+        (d, m, dist)
+        for d, m, dist in zip(docs, metas, dists)
+        if dist <= RELEVANCE_DISTANCE_THRESHOLD
+    ]
+    if not filtered:
+        return [], [], []
+    docs_f, metas_f, dists_f = zip(*filtered)
+    return list(docs_f), list(metas_f), list(dists_f)
 
 
 def _sse(payload: dict) -> str:
@@ -60,23 +100,22 @@ def reset_chat(session_id: str = "default"):
 
 class QueryRequest(BaseModel):
     question: str
-    session_id: str = Field(default="default", description="Session identifier for chat memory")
+    session_id: str = Field(
+        default="default", description="Session identifier for chat memory"
+    )
 
 
-# ── Non-streaming /query (kept as fallback) ────────────────────────────────────
+# ── Non-streaming /query ───────────────────────────────────────────────────────
 
 @router.post("/query")
 async def query_notes(request: QueryRequest):
-    """
-    Non-streaming endpoint. Kept for compatibility.
-    Prefer /query-stream for production use.
-    """
+    """Non-streaming fallback. Prefer /query-stream for production."""
     try:
         history = get_history(request.session_id)
-        docs, metas, dists = _retrieve(request.question)
+        docs, metas, dists = _retrieve(request.question, history)
+        docs, metas, dists = _filter_by_relevance(docs, metas, dists)
 
-        top_dist = dists[0] if dists else float("inf")
-        needs_general = not docs or top_dist > RELEVANCE_DISTANCE_THRESHOLD
+        needs_general = not docs
 
         if needs_general:
             overview = generate_general_overview(request.question)
@@ -87,9 +126,12 @@ async def query_notes(request: QueryRequest):
             add_message(request.session_id, "user", request.question)
             add_message(request.session_id, "assistant", answer)
             return {
-                "question": request.question, "answer": answer,
-                "sources": [], "chunks_data": [],
-                "confidence_score": 0.0, "answer_source": "general",
+                "question": request.question,
+                "answer": answer,
+                "sources": [],
+                "chunks_data": [],
+                "confidence_score": 0.0,
+                "answer_source": "general",
                 "session_id": request.session_id,
             }
 
@@ -102,15 +144,21 @@ async def query_notes(request: QueryRequest):
 
         confidence = compute_confidence(dists)
         sources = list({m.get("source", "N/A") for m in metas})
-        chunks_data = [{"source": m.get("source", "N/A"), "text": d} for d, m in zip(docs, metas)]
+        chunks_data = [
+            {"source": m.get("source", "N/A"), "text": d}
+            for d, m in zip(docs, metas)
+        ]
 
         if answer.strip() == NO_ANSWER_MSG:
             sources, confidence, chunks_data = [], 0.0, []
 
         return {
-            "question": request.question, "answer": answer,
-            "sources": sources, "chunks_data": chunks_data,
-            "confidence_score": confidence, "answer_source": "notes",
+            "question": request.question,
+            "answer": answer,
+            "sources": sources,
+            "chunks_data": chunks_data,
+            "confidence_score": confidence,
+            "answer_source": "notes",
             "session_id": request.session_id,
         }
 
@@ -128,10 +176,10 @@ async def query_notes_stream(request: QueryRequest):
     Final event: {"done": true, "confidence_score": X, "sources": [...], ...}
     """
     history = get_history(request.session_id)
-    docs, metas, dists = _retrieve(request.question)
+    docs, metas, dists = _retrieve(request.question, history)
+    docs, metas, dists = _filter_by_relevance(docs, metas, dists)
 
-    top_dist = dists[0] if dists else float("inf")
-    needs_general = not docs or top_dist > RELEVANCE_DISTANCE_THRESHOLD
+    needs_general = not docs
 
     def generate():
         full_answer = ""
@@ -167,7 +215,6 @@ async def query_notes_stream(request: QueryRequest):
                 if full_answer.strip() == NO_ANSWER_MSG:
                     sources, chunks_data, confidence = [], [], 0.0
 
-            # Persist conversation to memory
             add_message(request.session_id, "user", request.question)
             add_message(request.session_id, "assistant", full_answer)
 

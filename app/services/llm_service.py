@@ -22,7 +22,10 @@ _NOTES_SYSTEM = (
     '   "I could not find that information in the uploaded notes."\n'
     "4. Never guess, infer beyond the notes, or say phrases like 'generally', 'typically', or 'in most cases'.\n"
     "5. When the notes do contain the answer: be clear, use bullet points where helpful, and quote the notes.\n"
-    "6. Use conversation history only to resolve pronouns like 'it' or 'that' — never to add new knowledge.\n"
+    "6. Use conversation history ONLY to resolve pronouns like 'it' or 'that' — never to add new knowledge.\n"
+    "7. CRITICAL: The notes below are the ONLY source of truth. "
+    "If the notes discuss topic X but the question is about topic Y, say you could not find it — "
+    "do NOT answer topic Y from your training data.\n"
 )
 
 _GENERAL_SYSTEM = (
@@ -38,19 +41,25 @@ _GENERAL_SYSTEM = (
 
 # ── Message builders ───────────────────────────────────────────────────────────
 
-def _notes_messages(question: str, chunks: list[str], history: list[dict]) -> list[dict]:
-    context = "\n\n".join(c[:800] for c in chunks)
+def _notes_messages(
+    question: str, chunks: list[str], history: list[dict]
+) -> list[dict]:
+    # No truncation — chunks are already capped at 500 chars by chunk_service
+    context = "\n\n---\n\n".join(chunks)
     history_text = (
         "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in history)
         or "None"
     )
     return [
         {"role": "system", "content": _NOTES_SYSTEM},
-        {"role": "user", "content": (
-            f"Conversation History:\n{history_text}\n\n"
-            f"[NOTES START]\n{context}\n[NOTES END]\n\n"
-            f"Question: {question}"
-        )},
+        {
+            "role": "user",
+            "content": (
+                f"Conversation History:\n{history_text}\n\n"
+                f"[NOTES START]\n{context}\n[NOTES END]\n\n"
+                f"Question: {question}"
+            ),
+        },
     ]
 
 
@@ -61,9 +70,11 @@ def _general_messages(question: str) -> list[dict]:
     ]
 
 
-# ── Non-streaming (used by /query fallback) ────────────────────────────────────
+# ── Non-streaming ──────────────────────────────────────────────────────────────
 
-def generate_answer(question: str, retrieved_chunks: list[str], chat_history: list[dict]) -> str:
+def generate_answer(
+    question: str, retrieved_chunks: list[str], chat_history: list[dict]
+) -> str:
     resp = _client.chat.completions.create(
         model=MODEL,
         messages=_notes_messages(question, retrieved_chunks, chat_history),
@@ -79,9 +90,11 @@ def generate_general_overview(question: str) -> str:
     return resp.choices[0].message.content
 
 
-# ── Streaming generators (used by /query-stream) ───────────────────────────────
+# ── Streaming generators ───────────────────────────────────────────────────────
 
-def stream_answer(question: str, retrieved_chunks: list[str], chat_history: list[dict]):
+def stream_answer(
+    question: str, retrieved_chunks: list[str], chat_history: list[dict]
+):
     """Sync generator — yields string tokens for a notes-grounded answer."""
     stream = _client.chat.completions.create(
         model=MODEL,
@@ -110,7 +123,11 @@ def stream_general_overview(question: str):
 # ── Confidence scoring ─────────────────────────────────────────────────────────
 
 def compute_confidence(distances: list[float]) -> float:
-    """Map ChromaDB L2 distances to a 0–100 confidence score."""
+    """
+    Map ChromaDB L2 distances to a 0–100 confidence score.
+    Since we now only pass chunks with distance <= 0.8,
+    scores will be more meaningful (0.8 → 60%, 0.0 → 100%).
+    """
     if not distances:
         return 0.0
     avg = sum(distances) / len(distances)

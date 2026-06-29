@@ -14,7 +14,10 @@ class Message(TypedDict):
     content: str
 
 
-MAX_HISTORY_TURNS = 50  # Keep last N user+assistant pairs to bound context size
+# 6 turns = 12 messages (user + assistant pairs).
+# Enough for meaningful follow-up context without bloating the LLM prompt
+# with stale conversation that confuses topic resolution.
+MAX_HISTORY_TURNS = 6
 
 # session_id -> list of messages
 _sessions: dict[str, list[Message]] = {}
@@ -32,7 +35,6 @@ def add_message(session_id: str, role: str, content: str) -> None:
     history = _get_session(session_id)
     history.append({"role": role, "content": content})
 
-    # Each "turn" = 2 messages (user + assistant)
     max_messages = MAX_HISTORY_TURNS * 2
     if len(history) > max_messages:
         del history[: len(history) - max_messages]
