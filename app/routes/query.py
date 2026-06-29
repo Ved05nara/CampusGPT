@@ -1,153 +1,190 @@
+import json
 import logging
 import time
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.services.chroma_service import collection, search_chunks
-from app.services.embedding_service import model
-from app.services.llm_service import generate_answer, compute_confidence
+from app.services.embedding_service import model as embed_model
+from app.services.llm_service import (
+    generate_answer, generate_general_overview,
+    stream_answer, stream_general_overview,
+    compute_confidence,
+)
 from app.services.memory_service import add_message, clear_history, get_history
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
 NO_ANSWER_MSG = "I could not find that information in the uploaded notes."
-HISTORY_CONTEXT_TURNS = 3  # How many recent user turns to include in search query
-# L2 distance above this means the top chunk is too dissimilar — skip LLM entirely.
-# ChromaDB L2 distances: 0 = perfect, ~1.2+ = unrelated topic.
 RELEVANCE_DISTANCE_THRESHOLD = 1.2
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Utility endpoints
-# ---------------------------------------------------------------------------
+def _retrieve(question: str) -> tuple[list, list, list]:
+    """Embed question and fetch top-k chunks from ChromaDB."""
+    embedding = embed_model.encode(question).tolist()
+    results = search_chunks(embedding)
+    docs  = results.get("documents", [[]])[0] if results else []
+    metas = results.get("metadatas", [[]])[0] if results else []
+    dists = results.get("distances", [[]])[0] if results else []
+    return docs, metas, dists
 
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+# ── Utility endpoints ──────────────────────────────────────────────────────────
 
 @router.get("/stats")
 def stats():
-    """Return the total number of stored chunks."""
     return {"total_chunks": collection.count()}
 
 
 @router.get("/health")
 def health():
-    """Health check endpoint."""
     return {"status": "running", "chunks": collection.count()}
 
 
 @router.post("/reset-chat")
 def reset_chat(session_id: str = "default"):
-    """Clear the conversation history for the given session."""
     clear_history(session_id)
     return {"message": "Chat history cleared", "session_id": session_id}
 
 
-# ---------------------------------------------------------------------------
-# Query endpoint
-# ---------------------------------------------------------------------------
-
+# ── Request model ──────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
     question: str
     session_id: str = Field(default="default", description="Session identifier for chat memory")
 
 
+# ── Non-streaming /query (kept as fallback) ────────────────────────────────────
+
 @router.post("/query")
 async def query_notes(request: QueryRequest):
     """
-    Accept a question, retrieve relevant chunks from ChromaDB,
-    and return an LLM-generated answer grounded in those chunks.
-    Returns confidence_score (0-100) alongside the answer.
+    Non-streaming endpoint. Kept for compatibility.
+    Prefer /query-stream for production use.
     """
     try:
         history = get_history(request.session_id)
+        docs, metas, dists = _retrieve(request.question)
 
-        # Build a richer search query by appending recent context
-        recent_user_questions = [
-            msg["content"]
-            for msg in history
-            if msg["role"] == "user"
-        ][-HISTORY_CONTEXT_TURNS:]
+        top_dist = dists[0] if dists else float("inf")
+        needs_general = not docs or top_dist > RELEVANCE_DISTANCE_THRESHOLD
 
-        search_query = " ".join(recent_user_questions + [request.question])
-
-        question_embedding = model.encode(search_query).tolist()
-        results = search_chunks(question_embedding)
-
-        documents = results.get("documents", [[]])[0] if results else []
-        metadatas = results.get("metadatas", [[]])[0] if results else []
-        distances = results.get("distances", [[]])[0] if results else []
-
-        # No chunks found — return early without calling the LLM
-        if not documents:
-            answer = NO_ANSWER_MSG
-            add_message(request.session_id, "user", request.question)
-            add_message(request.session_id, "assistant", answer)
-            return {
-                "question": request.question,
-                "answer": answer,
-                "sources": [],
-                "confidence_score": 0.0,
-                "session_id": request.session_id,
-            }
-
-        # Relevance gate — if even the closest chunk is too far away, the question
-        # is almost certainly outside the scope of the uploaded notes.
-        top_distance = distances[0] if distances else float("inf")
-        if top_distance > RELEVANCE_DISTANCE_THRESHOLD:
-            logger.info(
-                "Question out of scope (top distance: %.4f > threshold %.2f): %s",
-                top_distance,
-                RELEVANCE_DISTANCE_THRESHOLD,
-                request.question,
+        if needs_general:
+            overview = generate_general_overview(request.question)
+            answer = (
+                "I couldn't find that information in your uploaded notes, "
+                f"but here's a general overview:\n\n{overview}"
             )
-            answer = NO_ANSWER_MSG
             add_message(request.session_id, "user", request.question)
             add_message(request.session_id, "assistant", answer)
             return {
-                "question": request.question,
-                "answer": answer,
-                "sources": [],
-                "confidence_score": 0.0,
+                "question": request.question, "answer": answer,
+                "sources": [], "chunks_data": [],
+                "confidence_score": 0.0, "answer_source": "general",
                 "session_id": request.session_id,
             }
-
-        logger.debug("Question: %s", request.question)
-        logger.debug(
-            "Retrieved %d chunks (top distance: %.4f)",
-            len(documents),
-            distances[0] if distances else -1,
-        )
 
         start = time.time()
-        answer = generate_answer(
-            question=request.question,
-            retrieved_chunks=documents,
-            chat_history=history,
-        )
+        answer = generate_answer(request.question, docs, history)
         logger.info("LLM response time: %.2f sec", time.time() - start)
 
         add_message(request.session_id, "user", request.question)
         add_message(request.session_id, "assistant", answer)
 
-        confidence_score = compute_confidence(distances)
+        confidence = compute_confidence(dists)
+        sources = list({m.get("source", "N/A") for m in metas})
+        chunks_data = [{"source": m.get("source", "N/A"), "text": d} for d, m in zip(docs, metas)]
 
-        sources = list({meta.get("source", "N/A") for meta in metadatas})
         if answer.strip() == NO_ANSWER_MSG:
-            sources = []
-            confidence_score = 0.0
+            sources, confidence, chunks_data = [], 0.0, []
 
         return {
-            "question": request.question,
-            "answer": answer,
-            "sources": sources,
-            "confidence_score": confidence_score,
+            "question": request.question, "answer": answer,
+            "sources": sources, "chunks_data": chunks_data,
+            "confidence_score": confidence, "answer_source": "notes",
             "session_id": request.session_id,
         }
 
     except Exception as exc:
         logger.exception("Query failed")
         raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc
+
+
+# ── Streaming /query-stream ────────────────────────────────────────────────────
+
+@router.post("/query-stream")
+async def query_notes_stream(request: QueryRequest):
+    """
+    SSE streaming endpoint. Yields tokens as they are generated by Groq.
+    Final event: {"done": true, "confidence_score": X, "sources": [...], ...}
+    """
+    history = get_history(request.session_id)
+    docs, metas, dists = _retrieve(request.question)
+
+    top_dist = dists[0] if dists else float("inf")
+    needs_general = not docs or top_dist > RELEVANCE_DISTANCE_THRESHOLD
+
+    def generate():
+        full_answer = ""
+        try:
+            if needs_general:
+                prefix = (
+                    "I couldn't find that information in your uploaded notes, "
+                    "but here's a general overview:\n\n"
+                )
+                full_answer += prefix
+                yield _sse({"token": prefix})
+
+                for tok in stream_general_overview(request.question):
+                    full_answer += tok
+                    yield _sse({"token": tok})
+
+                sources, chunks_data, confidence = [], [], 0.0
+                answer_source = "general"
+
+            else:
+                for tok in stream_answer(request.question, docs, history):
+                    full_answer += tok
+                    yield _sse({"token": tok})
+
+                confidence = compute_confidence(dists)
+                sources = list({m.get("source", "N/A") for m in metas})
+                chunks_data = [
+                    {"source": m.get("source", "N/A"), "text": d}
+                    for d, m in zip(docs, metas)
+                ]
+                answer_source = "notes"
+
+                if full_answer.strip() == NO_ANSWER_MSG:
+                    sources, chunks_data, confidence = [], [], 0.0
+
+            # Persist conversation to memory
+            add_message(request.session_id, "user", request.question)
+            add_message(request.session_id, "assistant", full_answer)
+
+            yield _sse({
+                "done": True,
+                "confidence_score": confidence,
+                "sources": sources,
+                "answer_source": answer_source,
+                "chunks_data": chunks_data,
+            })
+
+        except Exception as exc:
+            logger.exception("Stream generation failed")
+            yield _sse({"error": str(exc)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
