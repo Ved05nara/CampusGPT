@@ -16,7 +16,7 @@ class Message(TypedDict):
 
 _conversation_history: list[Message] = []
 
-MAX_HISTORY_TURNS = 10  # Keep last N user+assistant pairs to bound context size
+MAX_HISTORY_TURNS = 3  # Keep last N user+assistant pairs to bound context size
 
 
 def add_message(role: str, content: str) -> None:

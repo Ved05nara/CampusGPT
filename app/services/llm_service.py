@@ -46,7 +46,7 @@ def generate_answer(
     )
 
     response = chat(
-        model="qwen2.5:3b",
+        model="qwen2.5:1.5b",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
