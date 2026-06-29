@@ -1,81 +1,140 @@
-import { useState } from "react";
-import API from "./services/api";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { askQuestion, getDocuments, resetChat } from "./services/api";
+import Sidebar from "./components/Sidebar";
+import ChatWindow from "./components/ChatWindow";
+import QueryInput from "./components/QueryInput";
 
-function App() {
-    const [question, setQuestion] = useState("");
-    const [answer, setAnswer] = useState("");
-    const [sources, setSources] = useState([]);
+// ── Tiny toast system ──────────────────────────────────────────────────────────
+function useToasts() {
+    const [toasts, setToasts] = useState([]);
+    const add = useCallback((message, type = "info") => {
+        const id = Date.now();
+        setToasts((prev) => [...prev, { id, message, type }]);
+        setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
+    }, []);
+    return { toasts, add };
+}
 
-    const askQuestion = async () => {
+// ── Stable session ID for this browser tab ───────────────────────────────────
+function getSessionId() {
+    let id = sessionStorage.getItem("study_session_id");
+    if (!id) {
+        id = `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        sessionStorage.setItem("study_session_id", id);
+    }
+    return id;
+}
 
-        if (!question.trim()) return;
+const SESSION_ID = getSessionId();
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+export default function App() {
+    const [messages, setMessages] = useState([]);
+    const [documents, setDocuments] = useState([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const { toasts, add: addToast } = useToasts();
+
+    // ── Fetch document list ──────────────────────────────────────────────────
+    const fetchDocuments = useCallback(async () => {
         try {
-
-            const response = await API.post("/query", {
-                question: question
-            });
-
-            setAnswer(response.data.answer);
-            setSources(response.data.sources);
-
-        } catch (error) {
-
-            console.error(error);
-
-            setAnswer("Error getting response.");
+            const res = await getDocuments();
+            setDocuments(res.data.documents ?? []);
+        } catch {
+            // silently ignore on initial load failure
         }
-    };
+    }, []);
+
+    useEffect(() => {
+        fetchDocuments();
+    }, [fetchDocuments]);
+
+    // ── Send a question ──────────────────────────────────────────────────────
+    const handleSend = useCallback(async (question) => {
+        setMessages((prev) => [...prev, { role: "user", content: question }]);
+        setIsLoading(true);
+        try {
+            const res = await askQuestion(question, SESSION_ID);
+            const { answer, sources, confidence_score } = res.data;
+            setMessages((prev) => [
+                ...prev,
+                { role: "assistant", content: answer, sources, confidence_score },
+            ]);
+        } catch (err) {
+            const detail = err?.response?.data?.detail ?? "Failed to get a response.";
+            setMessages((prev) => [
+                ...prev,
+                { role: "assistant", content: `⚠️ ${detail}`, sources: [], confidence_score: 0 },
+            ]);
+            addToast(detail, "error");
+        } finally {
+            setIsLoading(false);
+        }
+    }, [addToast]);
+
+    // ── Clear chat ───────────────────────────────────────────────────────────
+    const handleClearChat = useCallback(async () => {
+        try {
+            await resetChat(SESSION_ID);
+        } catch {
+            // backend memory cleared best-effort
+        }
+        setMessages([]);
+        addToast("Chat cleared.", "info");
+    }, [addToast]);
+
+    // ── Stats for topbar ─────────────────────────────────────────────────────
+    const totalChunks = documents.reduce((s, d) => s + (d.chunk_count ?? 0), 0);
 
     return (
-        <div style={{
-            maxWidth: "900px",
-            margin: "50px auto",
-            fontFamily: "Arial"
-        }}>
-
-            <h1>AI Study Assistant</h1>
-
-            <textarea
-                rows="4"
-                style={{
-                    width: "100%",
-                    padding: "10px"
-                }}
-                value={question}
-                onChange={(e) =>
-                    setQuestion(e.target.value)
-                }
-                placeholder="Ask anything about your uploaded notes..."
+        <div className="app-layout">
+            {/* Left sidebar: documents + upload */}
+            <Sidebar
+                documents={documents}
+                onDocumentsChange={fetchDocuments}
+                onToast={addToast}
             />
 
-            <button
-                onClick={askQuestion}
-                style={{
-                    marginTop: "10px",
-                    padding: "10px 20px"
-                }}
-            >
-                Ask
-            </button>
+            {/* Right: header + chat + input */}
+            <div className="main-panel">
+                {/* Top bar */}
+                <header className="topbar">
+                    <div>
+                        <div className="topbar-title">CampusGPT</div>
+                        <div className="topbar-subtitle">
+                            {documents.length > 0
+                                ? `${documents.length} document${documents.length > 1 ? "s" : ""} · ${totalChunks} chunks indexed`
+                                : "Upload PDF files to get started"}
+                        </div>
+                    </div>
+                    <div className="topbar-actions">
+                        <span className="stats-chip">
+                            <span className="stats-dot" />
+                            AI Online
+                        </span>
+                    </div>
+                </header>
 
-            <hr />
+                {/* Chat messages */}
+                <ChatWindow messages={messages} isLoading={isLoading} />
 
-            <h2>Answer</h2>
+                {/* Input bar */}
+                <QueryInput
+                    onSend={handleSend}
+                    onClearChat={handleClearChat}
+                    isLoading={isLoading}
+                    hasMessages={messages.length > 0}
+                />
+            </div>
 
-            <p>{answer}</p>
-
-            <h2>Sources</h2>
-
-            <ul>
-                {sources?.map((source, index) => (
-                    <li key={index}>
-                        {source}
-                    </li>
+            {/* Toast notifications */}
+            <div className="toast-container">
+                {toasts.map((t) => (
+                    <div key={t.id} className={`toast toast-${t.type}`}>
+                        {t.message}
+                    </div>
                 ))}
-            </ul>
-
+            </div>
         </div>
     );
 }
-
-export default App;

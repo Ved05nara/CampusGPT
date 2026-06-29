@@ -2,8 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes.upload import router as upload_router
 from app.routes.query import router as query_router
+from app.routes.documents import router as documents_router
 
-app = FastAPI(title="AI Study Assistant", version="1.0.0")
+app = FastAPI(title="CampusGPT", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,8 +16,9 @@ app.add_middleware(
 
 app.include_router(upload_router)
 app.include_router(query_router)
+app.include_router(documents_router)
 
 
 @app.get("/")
 def root():
-    return {"message": "AI Study Assistant Running"}
+    return {"message": "AI Study Assistant v2.0 Running"}

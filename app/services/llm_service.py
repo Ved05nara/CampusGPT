@@ -1,5 +1,6 @@
 from ollama import chat
 
+
 def generate_answer(
     question: str,
     retrieved_chunks: list[str],
@@ -7,6 +8,7 @@ def generate_answer(
 ) -> str:
     """
     Generate an answer from the LLM using retrieved context and conversation history.
+    Strictly grounded — will only answer from the provided notes context.
 
     Args:
         question: The user's current question.
@@ -16,7 +18,8 @@ def generate_answer(
     Returns:
         The LLM's answer as a string.
     """
-    context = "\n\n".join(chunk[:300] for chunk in retrieved_chunks)
+    # Increased from 300 to 800 chars for richer context
+    context = "\n\n".join(chunk[:800] for chunk in retrieved_chunks)
 
     # Build structured conversation history for the system prompt
     history_lines = [
@@ -26,23 +29,21 @@ def generate_answer(
     history_text = "\n".join(history_lines) if history_lines else "None"
 
     system_prompt = (
-        "You are an expert college study assistant.\n\n"
-        "Rules:\n"
-        "1. Answer only from the provided context.\n"
-        "2. Explain concepts clearly.\n"
-        "3. Use bullet points when useful.\n"
-        "4. If examples are present in the context, include them.\n"
-        "5. If the user asks for examples, search the provided context carefully "
-        "before saying the information is unavailable.\n"
-        "6. Use conversation history to understand follow-up questions.\n"
-        "7. If the answer is not present in the context, say exactly: "
-        '"I could not find that information in the uploaded notes."'
+        "You are a study assistant that answers questions EXCLUSIVELY from the student notes provided.\n\n"
+        "STRICT RULES — follow ALL of these without any exception:\n"
+        "1. Answer ONLY using text found inside the [NOTES START] / [NOTES END] block.\n"
+        "2. Do NOT use your training knowledge, general knowledge, or anything outside the notes block.\n"
+        "3. If the answer is NOT present in the notes, respond with EXACTLY this sentence and nothing else:\n"
+        '   "I could not find that information in the uploaded notes."\n'
+        "4. Never guess, infer beyond the notes, or say phrases like \'generally\', \'typically\', or \'in most cases\'.\n"
+        "5. When the notes do contain the answer: be clear, use bullet points where helpful, and quote the notes.\n"
+        "6. Use conversation history only to resolve pronouns like \'it\' or \'that\' — never to add new knowledge.\n"
     )
 
     user_message = (
         f"Conversation History:\n{history_text}\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question:\n{question}"
+        f"[NOTES START]\n{context}\n[NOTES END]\n\n"
+        f"Question: {question}"
     )
 
     response = chat(
@@ -54,3 +55,24 @@ def generate_answer(
     )
 
     return response["message"]["content"]
+
+
+def compute_confidence(distances: list[float]) -> float:
+    """
+    Compute a confidence score (0–100) from ChromaDB L2 distances.
+
+    ChromaDB L2 distances are in [0, ~4]. A distance of 0 means perfect match.
+    We map this to a confidence percentage where lower distance = higher confidence.
+
+    Args:
+        distances: List of L2 distances from the top-k retrieved chunks.
+
+    Returns:
+        Confidence score as a float in [0, 100].
+    """
+    if not distances:
+        return 0.0
+    avg_distance = sum(distances) / len(distances)
+    # Normalise: assume max meaningful L2 distance is 2.0
+    confidence = max(0.0, 1.0 - avg_distance / 2.0) * 100
+    return round(confidence, 1)
