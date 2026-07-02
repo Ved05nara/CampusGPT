@@ -22,12 +22,10 @@ function GeneralKnowledgeBadge() {
     );
 }
 
-// ── Typing cursor (blinks inside streaming bubble) ─────────────────────────────
 function TypingCursor() {
     return <span className="typing-cursor" aria-hidden="true" />;
 }
 
-// ── Dots shown before first token arrives ─────────────────────────────────────
 function ThinkingDots() {
     return (
         <div className="typing-indicator">
@@ -41,31 +39,70 @@ function ThinkingDots() {
     );
 }
 
-// ── Source pill that expands to show the retrieved chunk ───────────────────────
-function SourcePill({ src, chunksData, isExpanded, onToggle }) {
-    const chunk = chunksData?.find((c) => c.source === src);
+// ── References panel (shown/hidden via toggle) ─────────────────────────────────
+function ReferencesSection({ chunksData }) {
+    const [expanded, setExpanded] = useState(null);
+
+    if (!chunksData || chunksData.length === 0) return null;
+
     return (
-        <div className="source-pill-wrapper">
-            <button
-                className={`source-pill${isExpanded ? " source-pill-active" : ""}`}
-                onClick={onToggle}
-                title={isExpanded ? "Collapse chunk" : "Click to view retrieved text"}
-            >
-                📄 {src} <span style={{ fontSize: 9, opacity: 0.7 }}>{isExpanded ? "▲" : "▼"}</span>
-            </button>
-            {isExpanded && chunk && (
-                <div className="chunk-panel">
-                    <div className="chunk-panel-header">📌 Retrieved from: {chunk.source}</div>
-                    <div className="chunk-panel-text">{chunk.text}</div>
-                </div>
-            )}
+        <div className="references-section">
+            <div className="references-header">
+                <span className="references-icon">📚</span>
+                <span className="references-title">References</span>
+                <span className="references-count">
+                    {chunksData.length} source{chunksData.length !== 1 ? "s" : ""}
+                </span>
+            </div>
+
+            <div className="references-list">
+                {chunksData.map((chunk, i) => {
+                    const isOpen  = expanded === i;
+                    const score   = chunk.rerank_score;
+                    const quality =
+                        score >= 5 ? "ref-quality-high" :
+                        score >= 0 ? "ref-quality-mid"  : "ref-quality-low";
+
+                    return (
+                        <div key={i} className={`reference-item ${isOpen ? "reference-item-open" : ""}`}>
+                            <button
+                                className="reference-header"
+                                onClick={() => setExpanded(isOpen ? null : i)}
+                                aria-expanded={isOpen}
+                            >
+                                <span className="reference-index">[{i + 1}]</span>
+                                <span className="reference-meta">
+                                    <span className="reference-filename">📄 {chunk.source}</span>
+                                    {chunk.page_number > 0 && (
+                                        <span className="reference-page">Page {chunk.page_number}</span>
+                                    )}
+                                </span>
+                                {score !== undefined && (
+                                    <span className={`reference-score ${quality}`}>
+                                        Score: {score.toFixed(2)}
+                                    </span>
+                                )}
+                                <span className="reference-chevron">{isOpen ? "▲" : "▼"}</span>
+                            </button>
+
+                            {isOpen && (
+                                <div className="reference-body">
+                                    <div className="reference-body-label">Retrieved excerpt:</div>
+                                    <div className="reference-body-text">{chunk.text}</div>
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
         </div>
     );
 }
 
-// ── Copy + Regenerate action bar ───────────────────────────────────────────────
-function MessageActions({ content, msgIndex, onRegenerate, onToast }) {
-    const [copied, setCopied] = useState(false);
+// ── Action bar: Copy · Regenerate · References ─────────────────────────────────
+function MessageActions({ content, msgIndex, onRegenerate, onToast, chunksData, hasNotes }) {
+    const [copied, setCopied]       = useState(false);
+    const [showRefs, setShowRefs]   = useState(false);
 
     const handleCopy = async () => {
         try {
@@ -79,35 +116,41 @@ function MessageActions({ content, msgIndex, onRegenerate, onToast }) {
     };
 
     return (
-        <div className="message-actions">
-            <button className="action-btn" onClick={handleCopy} title="Copy answer">
-                {copied ? "✓ Copied" : "⎘ Copy"}
-            </button>
-            <button
-                className="action-btn"
-                onClick={() => onRegenerate(msgIndex)}
-                title="Regenerate answer"
-            >
-                ↻ Regenerate
-            </button>
-        </div>
+        <>
+            <div className="message-actions">
+                <button className="action-btn" onClick={handleCopy} title="Copy answer">
+                    {copied ? "✓ Copied" : "⎘ Copy"}
+                </button>
+                <button
+                    className="action-btn"
+                    onClick={() => onRegenerate(msgIndex)}
+                    title="Regenerate answer"
+                >
+                    ↻ Regenerate
+                </button>
+                {hasNotes && chunksData?.length > 0 && (
+                    <button
+                        className={`action-btn ${showRefs ? "action-btn-active" : ""}`}
+                        onClick={() => setShowRefs((v) => !v)}
+                        title={showRefs ? "Hide references" : "Show references"}
+                    >
+                        📚 {showRefs ? "Hide refs" : `References (${chunksData.length})`}
+                    </button>
+                )}
+            </div>
+
+            {showRefs && <ReferencesSection chunksData={chunksData} />}
+        </>
     );
 }
 
 // ── Main ChatWindow ────────────────────────────────────────────────────────────
 export default function ChatWindow({ messages, isLoading, onRegenerate, onToast }) {
     const bottomRef = useRef(null);
-    // Track which source pills are expanded: key = `${msgIdx}-${src}`
-    const [expanded, setExpanded] = useState({});
 
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [messages, isLoading]);
-
-    const toggleChunk = (msgIdx, src) => {
-        const key = `${msgIdx}-${src}`;
-        setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
-    };
 
     if (messages.length === 0 && !isLoading) {
         return (
@@ -132,7 +175,6 @@ export default function ChatWindow({ messages, isLoading, onRegenerate, onToast 
                         {msg.role === "user" ? (
                             <span style={{ whiteSpace: "pre-wrap" }}>{msg.content}</span>
                         ) : msg.isStreaming && !msg.content ? (
-                            // Waiting for first token
                             <ThinkingDots />
                         ) : (
                             <>
@@ -142,27 +184,15 @@ export default function ChatWindow({ messages, isLoading, onRegenerate, onToast 
                         )}
                     </div>
 
-                    {/* Footer + actions — only when done streaming */}
                     {msg.role === "assistant" && !msg.isStreaming && (
                         <>
                             <div className="message-footer">
                                 {msg.answer_source === "general" ? (
                                     <GeneralKnowledgeBadge />
                                 ) : (
-                                    <>
-                                        {typeof msg.confidence_score === "number" && (
-                                            <ConfidenceBadge score={msg.confidence_score} />
-                                        )}
-                                        {msg.sources?.map((src, i) => (
-                                            <SourcePill
-                                                key={i}
-                                                src={src}
-                                                chunksData={msg.chunks_data}
-                                                isExpanded={!!expanded[`${idx}-${src}`]}
-                                                onToggle={() => toggleChunk(idx, src)}
-                                            />
-                                        ))}
-                                    </>
+                                    typeof msg.confidence_score === "number" && (
+                                        <ConfidenceBadge score={msg.confidence_score} />
+                                    )
                                 )}
                             </div>
 
@@ -171,6 +201,8 @@ export default function ChatWindow({ messages, isLoading, onRegenerate, onToast 
                                 msgIndex={idx}
                                 onRegenerate={onRegenerate}
                                 onToast={onToast}
+                                chunksData={msg.chunks_data}
+                                hasNotes={msg.answer_source === "notes"}
                             />
                         </>
                     )}

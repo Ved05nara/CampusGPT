@@ -1,7 +1,8 @@
 import logging
 import os
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.services.chroma_service import list_documents, delete_document
 
@@ -13,20 +14,23 @@ UPLOAD_DIR = "uploads"
 
 
 @router.get("")
-def get_documents():
+def get_documents(
+    subject: Optional[str] = Query(default=None, description="Filter by subject"),
+    semester: Optional[str] = Query(default=None, description="Filter by semester"),
+    department: Optional[str] = Query(default=None, description="Filter by department"),
+):
     """
-    Return a list of all documents indexed in ChromaDB,
-    including filename, chunk count, and upload time.
+    Return all indexed documents, with optional filters.
+    Example: GET /documents?subject=mathematics&semester=sem3
     """
-    docs = list_documents()
+    docs = list_documents(subject=subject, semester=semester, department=department)
     return {"documents": docs, "total": len(docs)}
 
 
 @router.delete("/{filename}")
 def remove_document(filename: str):
     """
-    Delete all chunks for the given filename from ChromaDB
-    and remove the file from disk if it exists.
+    Delete all chunks for the given filename from ChromaDB and remove from disk.
     """
     chunks_deleted = delete_document(filename)
 
@@ -36,7 +40,6 @@ def remove_document(filename: str):
             detail=f"Document '{filename}' not found in the index.",
         )
 
-    # Also remove from disk
     file_path = os.path.join(UPLOAD_DIR, filename)
     removed_from_disk = False
     if os.path.exists(file_path):

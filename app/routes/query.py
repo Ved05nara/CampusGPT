@@ -21,35 +21,35 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 NO_ANSWER_MSG = "I could not find that information in the uploaded notes."
-
-# ── Tuned thresholds ───────────────────────────────────────────────────────────
-# all-MiniLM-L6-v2 L2 distances: <0.5 = very relevant, 0.5–0.8 = relevant,
-# >0.8 = loosely related, >1.0 = likely off-topic.
-# Keep only chunks below this distance; if none survive → fall back to general.
 RELEVANCE_DISTANCE_THRESHOLD = 0.8
-
-# How many recent user turns to blend into the search query for follow-ups
 SEARCH_HISTORY_TURNS = 2
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _build_search_query(question: str, history: list[dict]) -> str:
-    """
-    Blend the last N user messages into the search query so that
-    follow-up questions like "explain it further" retrieve the right chunks.
-    """
-    recent = [
-        m["content"] for m in history if m["role"] == "user"
-    ][-SEARCH_HISTORY_TURNS:]
+    recent = [m["content"] for m in history if m["role"] == "user"][-SEARCH_HISTORY_TURNS:]
     return " ".join(recent + [question])
 
 
-def _retrieve(question: str, history: list[dict]) -> tuple[list, list, list]:
-    """Embed question (with history context) and fetch top-k chunks from ChromaDB."""
+def _retrieve(
+    question: str,
+    history: list[dict],
+    subject: str | None = None,
+    semester: str | None = None,
+    department: str | None = None,
+    filename: str | None = None,
+) -> tuple[list, list, list]:
+    """Embed question (with history context) and fetch filtered chunks from ChromaDB."""
     search_query = _build_search_query(question, history)
     embedding = embed_model.encode(search_query).tolist()
-    results = search_chunks(embedding)
+    results = search_chunks(
+        embedding,
+        subject=subject,
+        semester=semester,
+        department=department,
+        filename=filename,
+    )
     docs  = results.get("documents", [[]])[0] if results else []
     metas = results.get("metadatas", [[]])[0] if results else []
     dists = results.get("distances", [[]])[0] if results else []
@@ -59,10 +59,7 @@ def _retrieve(question: str, history: list[dict]) -> tuple[list, list, list]:
 def _filter_by_relevance(
     docs: list, metas: list, dists: list
 ) -> tuple[list, list, list]:
-    """
-    Drop any chunk whose L2 distance exceeds the threshold.
-    This prevents off-topic chunks from polluting the LLM prompt.
-    """
+    """Drop chunks whose L2 distance exceeds the relevance threshold."""
     filtered = [
         (d, m, dist)
         for d, m, dist in zip(docs, metas, dists)
@@ -100,9 +97,13 @@ def reset_chat(session_id: str = "default"):
 
 class QueryRequest(BaseModel):
     question: str
-    session_id: str = Field(
-        default="default", description="Session identifier for chat memory"
-    )
+    session_id: str = Field(default="default", description="Session identifier for chat memory")
+
+    # Optional retrieval filters — all are case-insensitive (lowercased at store time)
+    subject: str | None = Field(default=None, description="Filter by subject e.g. 'mathematics'")
+    semester: str | None = Field(default=None, description="Filter by semester e.g. 'sem3'")
+    department: str | None = Field(default=None, description="Filter by department e.g. 'cs'")
+    filename: str | None = Field(default=None, description="Filter by specific document filename")
 
 
 # ── Non-streaming /query ───────────────────────────────────────────────────────
@@ -112,9 +113,14 @@ async def query_notes(request: QueryRequest):
     """Non-streaming fallback. Prefer /query-stream for production."""
     try:
         history = get_history(request.session_id)
-        docs, metas, dists = _retrieve(request.question, history)
+        docs, metas, dists = _retrieve(
+            request.question, history,
+            subject=request.subject,
+            semester=request.semester,
+            department=request.department,
+            filename=request.filename,
+        )
         docs, metas, dists = _filter_by_relevance(docs, metas, dists)
-
         needs_general = not docs
 
         if needs_general:
@@ -145,7 +151,11 @@ async def query_notes(request: QueryRequest):
         confidence = compute_confidence(dists)
         sources = list({m.get("source", "N/A") for m in metas})
         chunks_data = [
-            {"source": m.get("source", "N/A"), "text": d}
+            {
+                "source": m.get("source", "N/A"),
+                "page_number": m.get("page_number", 0),
+                "text": d,
+            }
             for d, m in zip(docs, metas)
         ]
 
@@ -176,9 +186,14 @@ async def query_notes_stream(request: QueryRequest):
     Final event: {"done": true, "confidence_score": X, "sources": [...], ...}
     """
     history = get_history(request.session_id)
-    docs, metas, dists = _retrieve(request.question, history)
+    docs, metas, dists = _retrieve(
+        request.question, history,
+        subject=request.subject,
+        semester=request.semester,
+        department=request.department,
+        filename=request.filename,
+    )
     docs, metas, dists = _filter_by_relevance(docs, metas, dists)
-
     needs_general = not docs
 
     def generate():
@@ -191,14 +206,11 @@ async def query_notes_stream(request: QueryRequest):
                 )
                 full_answer += prefix
                 yield _sse({"token": prefix})
-
                 for tok in stream_general_overview(request.question):
                     full_answer += tok
                     yield _sse({"token": tok})
-
                 sources, chunks_data, confidence = [], [], 0.0
                 answer_source = "general"
-
             else:
                 for tok in stream_answer(request.question, docs, history):
                     full_answer += tok
@@ -207,7 +219,11 @@ async def query_notes_stream(request: QueryRequest):
                 confidence = compute_confidence(dists)
                 sources = list({m.get("source", "N/A") for m in metas})
                 chunks_data = [
-                    {"source": m.get("source", "N/A"), "text": d}
+                    {
+                        "source": m.get("source", "N/A"),
+                        "page_number": m.get("page_number", 0),
+                        "text": d,
+                    }
                     for d, m in zip(docs, metas)
                 ]
                 answer_source = "notes"
