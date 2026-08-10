@@ -12,10 +12,13 @@ function formatDate(iso) {
 }
 
 export default function Sidebar({ documents, onDocumentsChange, onToast }) {
-    const [dragOver, setDragOver] = useState(false);
-    const [uploading, setUploading] = useState(false);
-    const [progress, setProgress] = useState(0);
-    const [confirmDelete, setConfirmDelete] = useState(null); // filename to confirm
+    const [dragOver, setDragOver]       = useState(false);
+    const [uploading, setUploading]     = useState(false);
+    const [progress, setProgress]       = useState(0);
+    const [confirmDelete, setConfirmDelete] = useState(null);
+    const [showAdvanced, setShowAdvanced]   = useState(false);
+    const [chunkSize, setChunkSize]         = useState(500);
+    const [overlap, setOverlap]             = useState(100);
     const fileInputRef = useRef(null);
 
     const handleFiles = useCallback(async (files) => {
@@ -29,7 +32,7 @@ export default function Sidebar({ documents, onDocumentsChange, onToast }) {
         try {
             const res = await uploadMultipleFiles(pdfs, (e) => {
                 if (e.total) setProgress(Math.round((e.loaded / e.total) * 100));
-            });
+            }, chunkSize, overlap);
             const data = res.data;
             const ok = data.results?.filter((r) => !r.error).length || 0;
             const errs = data.results?.filter((r) => r.error).length || 0;
@@ -43,7 +46,7 @@ export default function Sidebar({ documents, onDocumentsChange, onToast }) {
             setProgress(0);
             if (fileInputRef.current) fileInputRef.current.value = "";
         }
-    }, [onDocumentsChange, onToast]);
+    }, [onDocumentsChange, onToast, chunkSize, overlap]);
 
     const handleDrop = (e) => {
         e.preventDefault();
@@ -104,6 +107,49 @@ export default function Sidebar({ documents, onDocumentsChange, onToast }) {
                         {uploading && (
                             <div className="upload-progress">
                                 <div className="upload-progress-bar" style={{ width: `${progress}%` }} />
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Advanced chunking options */}
+                    <div className="upload-advanced">
+                        <button
+                            className="upload-advanced-toggle"
+                            onClick={() => setShowAdvanced((v) => !v)}
+                            type="button"
+                        >
+                            <span>{showAdvanced ? "▾" : "▸"} Advanced</span>
+                        </button>
+                        {showAdvanced && (
+                            <div className="upload-advanced-body">
+                                <label className="adv-label">
+                                    <span>Chunk Size</span>
+                                    <input
+                                        type="number"
+                                        className="adv-input"
+                                        min={100}
+                                        max={2000}
+                                        step={50}
+                                        value={chunkSize}
+                                        onChange={(e) => setChunkSize(Number(e.target.value))}
+                                        disabled={uploading}
+                                    />
+                                    <span className="adv-hint">chars</span>
+                                </label>
+                                <label className="adv-label">
+                                    <span>Overlap</span>
+                                    <input
+                                        type="number"
+                                        className="adv-input"
+                                        min={0}
+                                        max={500}
+                                        step={25}
+                                        value={overlap}
+                                        onChange={(e) => setOverlap(Number(e.target.value))}
+                                        disabled={uploading}
+                                    />
+                                    <span className="adv-hint">chars</span>
+                                </label>
                             </div>
                         )}
                     </div>

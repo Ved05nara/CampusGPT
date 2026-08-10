@@ -5,11 +5,11 @@ const BASE = "http://localhost:8000";
 const API = axios.create({ baseURL: BASE });
 
 // ── Streaming query (SSE via native fetch) ─────────────────────────────────────
-export const streamQuestion = (question, sessionId, onToken, onDone, onError) => {
+export const streamQuestion = (question, sessionId, onToken, onDone, onError, topK = 5) => {
     fetch(`${BASE}/query-stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, session_id: sessionId }),
+        body: JSON.stringify({ question, session_id: sessionId, top_k: topK }),
     })
         .then(async (response) => {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -54,9 +54,11 @@ export const uploadFile = (file, onProgress) => {
     });
 };
 
-export const uploadMultipleFiles = (files, onProgress) => {
+export const uploadMultipleFiles = (files, onProgress, chunkSize = 500, overlap = 100) => {
     const form = new FormData();
     files.forEach((f) => form.append("files", f));
+    form.append("chunk_size", chunkSize);
+    form.append("overlap", overlap);
     return API.post("/upload-multiple", form, {
         headers: { "Content-Type": "multipart/form-data" },
         onUploadProgress: onProgress,

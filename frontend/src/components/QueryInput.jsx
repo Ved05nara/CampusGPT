@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 
-export default function QueryInput({ onSend, onClearChat, isLoading, hasMessages }) {
+export default function QueryInput({ onSend, onClearChat, isLoading, hasMessages, topK, onTopKChange }) {
     const [text, setText] = useState("");
     const textareaRef = useRef(null);
 
@@ -21,7 +21,6 @@ export default function QueryInput({ onSend, onClearChat, isLoading, hasMessages
         if (!trimmed || isLoading) return;
         onSend(trimmed);
         setText("");
-        // reset textarea height
         if (textareaRef.current) {
             textareaRef.current.style.height = "auto";
         }
@@ -63,17 +62,37 @@ export default function QueryInput({ onSend, onClearChat, isLoading, hasMessages
                     Press <kbd style={{ fontSize: 10, background: "rgba(255,255,255,0.08)", padding: "1px 5px", borderRadius: 4, border: "1px solid rgba(255,255,255,0.12)" }}>Enter</kbd> to send &nbsp;·&nbsp;
                     <kbd style={{ fontSize: 10, background: "rgba(255,255,255,0.08)", padding: "1px 5px", borderRadius: 4, border: "1px solid rgba(255,255,255,0.12)" }}>Shift+Enter</kbd> for new line
                 </span>
-                {hasMessages && (
-                    <button
-                        className="btn btn-ghost"
-                        style={{ fontSize: 12, padding: "4px 10px" }}
-                        onClick={onClearChat}
-                        disabled={isLoading}
-                        id="clear-chat-btn"
-                    >
-                        🗑 Clear Chat
-                    </button>
-                )}
+
+                <div className="query-controls">
+                    {/* Top-K slider */}
+                    <label className="topk-control" title="Number of note chunks sent to the AI (higher = more context, slower)">
+                        <span className="topk-label">Context</span>
+                        <input
+                            id="topk-slider"
+                            type="range"
+                            min={1}
+                            max={15}
+                            step={1}
+                            value={topK}
+                            onChange={(e) => onTopKChange(Number(e.target.value))}
+                            disabled={isLoading}
+                            className="topk-slider"
+                        />
+                        <span className="topk-value">{topK}</span>
+                    </label>
+
+                    {hasMessages && (
+                        <button
+                            className="btn btn-ghost"
+                            style={{ fontSize: 12, padding: "4px 10px" }}
+                            onClick={onClearChat}
+                            disabled={isLoading}
+                            id="clear-chat-btn"
+                        >
+                            🗑 Clear Chat
+                        </button>
+                    )}
+                </div>
             </div>
         </div>
     );

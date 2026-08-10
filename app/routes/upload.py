@@ -5,6 +5,7 @@ from typing import List
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile, File
 
+from app.services.chunk_service import chunk_text_with_pages
 from app.services.chroma_service import store_chunks, list_documents, get_all_chunks
 from app.services.embedding_service import generate_embeddings
 from app.services.pdf_service import extract_text_from_pdf_with_pages
@@ -18,47 +19,6 @@ UPLOAD_DIR = "uploads"
 ALLOWED_EXTENSIONS = {".pdf"}
 
 
-def chunk_text_with_pages(
-    pages: list[tuple[int, str]],
-    chunk_size: int = 500,
-    overlap: int = 100,
-) -> tuple[list[str], list[int]]:
-    """Chunk page-aware text while tracking source page numbers."""
-    chunks: list[str] = []
-    page_numbers: list[int] = []
-
-    for page_num, text in pages:
-        if not text.strip():
-            continue
-        words = text.split()
-        current_words: list[str] = []
-        current_chars = 0
-
-        for word in words:
-            word_len = len(word) + 1
-            if current_chars + word_len > chunk_size and current_words:
-                chunks.append(" ".join(current_words))
-                page_numbers.append(page_num)
-
-                overlap_words: list[str] = []
-                overlap_chars = 0
-                for w in reversed(current_words):
-                    if overlap_chars + len(w) + 1 > overlap:
-                        break
-                    overlap_words.insert(0, w)
-                    overlap_chars += len(w) + 1
-
-                current_words = overlap_words
-                current_chars = overlap_chars
-
-            current_words.append(word)
-            current_chars += word_len
-
-        if current_words:
-            chunks.append(" ".join(current_words))
-            page_numbers.append(page_num)
-
-    return chunks, page_numbers
 
 
 @router.post("/upload")
@@ -67,6 +27,8 @@ async def upload_pdf(
     subject: str = Form(default=""),
     semester: str = Form(default=""),
     department: str = Form(default=""),
+    chunk_size: int = Form(default=500),
+    overlap: int = Form(default=100),
 ):
     """
     Accept a PDF upload with optional metadata.
@@ -93,7 +55,7 @@ async def upload_pdf(
         upload_time = datetime.now(timezone.utc).isoformat()
         pages = extract_text_from_pdf_with_pages(file_path)
         full_text = "\n".join(text for _, text in pages)
-        chunks, page_numbers = chunk_text_with_pages(pages)
+        chunks, page_numbers = chunk_text_with_pages(pages, chunk_size=chunk_size, overlap=overlap)
         embeddings = generate_embeddings(chunks)
 
         store_chunks(
@@ -127,6 +89,8 @@ async def upload_pdf(
             "subject": subject,
             "semester": semester,
             "department": department,
+            "chunk_size": chunk_size,
+            "overlap": overlap,
         }
 
     except ValueError as exc:
@@ -142,14 +106,17 @@ async def upload_multiple_pdfs(
     subject: str = Form(default=""),
     semester: str = Form(default=""),
     department: str = Form(default=""),
+    chunk_size: int = Form(default=500),
+    overlap: int = Form(default=100),
 ):
-    """Accept multiple PDF uploads with shared metadata."""
+    """Accept multiple PDF uploads with shared metadata and chunking settings."""
     results = []
     for file in files:
         try:
             result = await upload_pdf(
                 file=file, subject=subject,
                 semester=semester, department=department,
+                chunk_size=chunk_size, overlap=overlap,
             )
             results.append(result)
         except HTTPException as exc:

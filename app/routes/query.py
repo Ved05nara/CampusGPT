@@ -2,6 +2,7 @@ import json
 import logging
 import time
 
+import numpy as np
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -10,6 +11,7 @@ from app.services.chroma_service import collection, search_chunks, get_ids_for_f
 from app.services.embedding_service import model as embed_model
 from app.services.bm25_service import bm25_search
 from app.services.reranker_service import rerank
+from app.services.query_expansion_service import expand_query
 from app.services.llm_service import (
     generate_answer, generate_general_overview,
     stream_answer, stream_general_overview,
@@ -25,7 +27,7 @@ NO_ANSWER_MSG = "I could not find that information in the uploaded notes."
 VECTOR_FETCH = 10        # how many chunks vector search retrieves
 BM25_FETCH = 10          # how many chunks BM25 retrieves
 RRF_K = 60               # RRF constant (higher = smoother rank fusion)
-RERANK_TOP_K = 5         # candidates sent to cross-encoder, then to LLM
+RERANK_TOP_K = 5         # default candidates sent to cross-encoder, then to LLM
 RELEVANCE_THRESHOLD = 0.0  # cross-encoder scores are unbounded; 0.0 keeps positives
 SEARCH_HISTORY_TURNS = 2
 
@@ -94,18 +96,29 @@ def _hybrid_retrieve(
     semester: str | None = None,
     department: str | None = None,
     filename: str | None = None,
+    top_k: int = RERANK_TOP_K,
 ) -> list[dict]:
     """
     Full hybrid retrieval pipeline:
-      1. Vector search (ChromaDB)
-      2. BM25 keyword search
-      3. RRF merge
-      4. Cross-encoder re-rank → top RERANK_TOP_K
+      1. Query expansion  → 2–3 alternative phrasings
+      2. Vector search    (ChromaDB, averaged multi-query embedding)
+      3. BM25 keyword search (expanded query string)
+      4. RRF merge
+      5. Cross-encoder re-rank → top top_k
     """
-    search_query = _build_search_query(question, history)
-    embedding = embed_model.encode(search_query).tolist()
+    # 1. Query expansion
+    expanded_queries = expand_query(question)
+    base_search_query = _build_search_query(question, history)
 
-    # 1. Vector search
+    # Build an enriched BM25 query from all expanded phrasings + history context
+    all_terms = " ".join(expanded_queries)
+    bm25_query = f"{base_search_query} {all_terms}".strip()
+
+    # Average embeddings over all expanded phrasings for a richer vector query
+    embeddings = [embed_model.encode(q) for q in expanded_queries]
+    embedding = np.mean(embeddings, axis=0).tolist()
+
+    # 2. Vector search
     v_results = search_chunks(
         embedding, n_results=VECTOR_FETCH,
         subject=subject, semester=semester,
@@ -115,18 +128,18 @@ def _hybrid_retrieve(
     v_metas = v_results.get("metadatas", [[]])[0] if v_results else []
     v_dists = v_results.get("distances", [[]])[0] if v_results else []
 
-    # 2. BM25 search (respects metadata filters via id allowlist)
+    # 3. BM25 search (respects metadata filters via id allowlist)
     filter_ids = get_ids_for_filter(subject, semester, department, filename)
-    bm25_results = bm25_search(search_query, n_results=BM25_FETCH, filter_ids=filter_ids)
+    bm25_results = bm25_search(bm25_query, n_results=BM25_FETCH, filter_ids=filter_ids)
 
-    # 3. RRF merge
+    # 4. RRF merge
     merged = _rrf_merge((v_docs, v_metas, v_dists), bm25_results)
 
     if not merged:
         return []
 
-    # 4. Cross-encoder re-rank
-    reranked = rerank(question, merged, top_k=RERANK_TOP_K)
+    # 5. Cross-encoder re-rank
+    reranked = rerank(question, merged, top_k=top_k)
 
     # Filter out chunks with negative cross-encoder scores (clearly irrelevant)
     return [c for c in reranked if c.get("rerank_score", 0.0) >= RELEVANCE_THRESHOLD]
@@ -168,6 +181,7 @@ class QueryRequest(BaseModel):
     semester: str | None = Field(default=None)
     department: str | None = Field(default=None)
     filename: str | None = Field(default=None)
+    top_k: int = Field(default=5, ge=1, le=15, description="Number of chunks sent to the LLM (1–15)")
 
 
 # ── Non-streaming /query ───────────────────────────────────────────────────────
@@ -181,6 +195,7 @@ async def query_notes(request: QueryRequest):
             request.question, history,
             subject=request.subject, semester=request.semester,
             department=request.department, filename=request.filename,
+            top_k=request.top_k,
         )
 
         needs_general = not candidates
@@ -247,6 +262,7 @@ async def query_notes_stream(request: QueryRequest):
         request.question, history,
         subject=request.subject, semester=request.semester,
         department=request.department, filename=request.filename,
+        top_k=request.top_k,
     )
     needs_general = not candidates
 

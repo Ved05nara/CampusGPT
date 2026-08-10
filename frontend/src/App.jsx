@@ -48,6 +48,7 @@ export default function App() {
     const [messages, setMessages]   = useState([]);
     const [documents, setDocuments] = useState([]);
     const [isLoading, setIsLoading] = useState(false);
+    const [topK, setTopK]           = useState(5);
     const { toasts, add: addToast } = useToasts();
     const { theme, toggle: toggleTheme } = useTheme();
 
@@ -62,7 +63,7 @@ export default function App() {
     useEffect(() => { fetchDocuments(); }, [fetchDocuments]);
 
     // ── Core streaming logic ───────────────────────────────────────────────────
-    const streamAndAppend = useCallback((question) => {
+    const streamAndAppend = useCallback((question, currentTopK) => {
         setIsLoading(true);
 
         // Push a streaming placeholder as the last message
@@ -131,29 +132,28 @@ export default function App() {
                 });
                 setIsLoading(false);
                 addToast(error, "error");
-            }
+            },
+            currentTopK,
         );
     }, [addToast]);
 
     // ── Send ───────────────────────────────────────────────────────────────────
     const handleSend = useCallback((question) => {
         setMessages((prev) => [...prev, { role: "user", content: question }]);
-        streamAndAppend(question);
-    }, [streamAndAppend]);
+        streamAndAppend(question, topK);
+    }, [streamAndAppend, topK]);
 
     // ── Regenerate ─────────────────────────────────────────────────────────────
     const handleRegenerate = useCallback((msgIndex) => {
         if (isLoading) return;
-        // Find the nearest user message before this assistant message
         const userMsg = messages
             .slice(0, msgIndex)
             .reverse()
             .find((m) => m.role === "user");
         if (!userMsg) return;
-        // Remove the assistant message being regenerated
         setMessages((prev) => prev.slice(0, msgIndex));
-        streamAndAppend(userMsg.content);
-    }, [messages, isLoading, streamAndAppend]);
+        streamAndAppend(userMsg.content, topK);
+    }, [messages, isLoading, streamAndAppend, topK]);
 
     // ── Clear chat ─────────────────────────────────────────────────────────────
     const handleClearChat = useCallback(async () => {
@@ -210,6 +210,8 @@ export default function App() {
                     onClearChat={handleClearChat}
                     isLoading={isLoading}
                     hasMessages={messages.length > 0}
+                    topK={topK}
+                    onTopKChange={setTopK}
                 />
             </div>
 
